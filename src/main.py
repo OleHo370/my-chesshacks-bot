@@ -249,12 +249,12 @@ def get_move(ctx: GameContext) -> Move:
     
     num_pieces = len(ctx.board.piece_map())
     
-    if num_pieces <= 7:
-        search_depth = 4
-    elif num_pieces <= 14:
+    if num_pieces <= 5:
         search_depth = 3
-    else:
+    elif num_pieces <= 8:
         search_depth = 2
+    else:
+        search_depth = 1
 
     maximizing = ctx.board.turn
     
