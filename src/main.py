@@ -75,6 +75,8 @@ model = None
 encoder = BoardEncoder()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+transposition_table = {}
+MAX_TABLE_SIZE = 50000
 
 def initialize_model():
     global model
@@ -87,6 +89,26 @@ def initialize_model():
 
     return model
 
+def get_position_key(board):
+    return (board.fen().split(' ')[0], board.turn)
+
+def evaluate_with_nn(board):
+    pos_key = get_position_key(board)
+    
+    if pos_key in transposition_table:
+        return transposition_table[pos_key]
+    
+    board_features = encoder.encode_board(board)
+    board_tensor = torch.from_numpy(board_features).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        evaluation = model(board_tensor).item()
+    
+    if len(transposition_table) < MAX_TABLE_SIZE:
+        transposition_table[pos_key] = evaluation
+    
+    return evaluation
+
 def order_moves(board, moves):
     move_scores = []
 
@@ -95,46 +117,41 @@ def order_moves(board, moves):
 
         if board.is_capture(move):
             captured_piece = board.piece_at(move.to_square)
-
             if captured_piece:
-                victim_value = [0,1,3,3,5,9,0][captured_piece.piece_type]
+                victim_value = [0, 1, 3, 3, 5, 9, 0][captured_piece.piece_type]
                 attacker = board.piece_at(move.from_square)
-                attacker_value = [0,1,3,3,5,9,0][attacker.piece_type] if attacker else 0
-                score += (victim_value - attacker_value*0.1)*10
+                attacker_value = [0, 1, 3, 3, 5, 9, 0][attacker.piece_type] if attacker else 0
+                score += (victim_value * 10 - attacker_value)
+        
         board.push(move)
-
         if board.is_check():
             score += 5
-
         board.pop()
 
         if move.promotion:
-            score += 8
+            score += 9
+        
         move_scores.append((score, move))
 
-    move_scores.sort(reverse=True, key=lambda x:x[0])
+    move_scores.sort(reverse=True, key=lambda x: x[0])
     return [move for _, move in move_scores]
 
 def minimax_search(board, depth, alpha, beta, maximizing_player):
-
-    if depth == 0 or board.is_game_over():
-        board_features = encoder.encode_board(board)
-        board_tensor = torch.from_numpy(board_features).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            evaluation = model(board_tensor).item()
-
-        if board.is_checkmate():
-            return (10.0 if not board.turn else -10.0), None
-        
-        elif board.is_stalemate() or board.is_insufficient_material():
-            return 0.0, None
-        
+    
+    if board.is_checkmate():
+        return (-10.0 if maximizing_player else 10.0), None
+    
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0.0, None
+    
+    if depth == 0:
+        evaluation = evaluate_with_nn(board)
         return evaluation, None
+    
     legal_moves = list(board.legal_moves)
-
     if not legal_moves:
         return 0.0, None
+    
     legal_moves = order_moves(board, legal_moves)
     best_move = legal_moves[0]
 
@@ -143,16 +160,17 @@ def minimax_search(board, depth, alpha, beta, maximizing_player):
 
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = minimax_search(board, depth-1, alpha, beta, False)
+            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, False)
             board.pop()
 
             if eval_score > max_eval:
                 max_eval = eval_score
                 best_move = move
+            
             alpha = max(alpha, eval_score)
-
             if beta <= alpha:
-                break
+                break 
+        
         return max_eval, best_move
     
     else:
@@ -160,31 +178,61 @@ def minimax_search(board, depth, alpha, beta, maximizing_player):
 
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = minimax_search(board, depth-1, alpha, beta, True)
+            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, True)
             board.pop()
 
             if eval_score < min_eval:
                 min_eval = eval_score
                 best_move = move
+            
             beta = min(beta, eval_score)
-
             if beta <= alpha:
                 break
 
         return min_eval, best_move
 
-def evaluate_position(board, move):
-    board.push(move)
-
-    board_features = encoder.encode_board(board)
-    board_tensor = torch.from_numpy(board_features).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        evaluation = model(board_tensor).item()
-
-    board.pop()
-
-    return evaluation
+def batch_evaluate_moves(board, moves):
+    if len(moves) == 0:
+        return {}
+    
+    features_list = []
+    valid_moves = []
+    
+    for move in moves:
+        board.push(move)
+        pos_key = get_position_key(board)
+        
+        if pos_key in transposition_table:
+            board.pop()
+            continue
+        
+        features = encoder.encode_board(board)
+        features_list.append(features)
+        valid_moves.append((move, pos_key))
+        board.pop()
+    
+    if features_list:
+        batch_tensor = torch.from_numpy(np.array(features_list)).to(device)
+        with torch.no_grad():
+            evaluations = model(batch_tensor).squeeze().cpu().numpy()
+        
+        if len(features_list) == 1:
+            evaluations = [evaluations.item()]
+        else:
+            evaluations = evaluations.tolist()
+        
+        for (move, pos_key), eval_score in zip(valid_moves, evaluations):
+            if len(transposition_table) < MAX_TABLE_SIZE:
+                transposition_table[pos_key] = eval_score
+    
+    move_scores = {}
+    for move in moves:
+        board.push(move)
+        pos_key = get_position_key(board)
+        move_scores[move] = transposition_table.get(pos_key, 0.0)
+        board.pop()
+    
+    return move_scores
 
 @chess_manager.entrypoint
 def get_move(ctx: GameContext) -> Move:
@@ -192,42 +240,52 @@ def get_move(ctx: GameContext) -> Move:
 
     if model is None:
         initialize_model()
+    
     legal_moves = list(ctx.board.generate_legal_moves())
 
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available")
+    
     num_pieces = len(ctx.board.piece_map())
     
-    if num_pieces <= 8:
+    if num_pieces <= 7:
         search_depth = 4
-    elif num_pieces <= 16:
+    elif num_pieces <= 14:
         search_depth = 3
     else:
         search_depth = 2
 
     maximizing = ctx.board.turn
-    best_eval, best_move = minimax_search(ctx.board, search_depth, float('-inf'), float('inf'), maximizing)
+    
+    best_eval, best_move = minimax_search(
+        ctx.board, search_depth, float('-inf'), float('inf'), maximizing
+    )
+    
     if best_move is None:
         best_move = legal_moves[0]
-    move_scores = {move: evaluate_position(ctx.board, move) for move in legal_moves}
-    scores_array = np.array(list(move_scores.values()))
+    
+    move_scores = batch_evaluate_moves(ctx.board, legal_moves)
+    
+    scores_array = np.array([move_scores[move] for move in legal_moves])
 
     if not ctx.board.turn:
         scores_array = -scores_array
 
     exp_scores = np.exp(scores_array / 0.5)
-
     probabilities = exp_scores / np.sum(exp_scores)
 
     move_probs = {move: prob for move, prob in zip(legal_moves, probabilities)}
     ctx.logProbabilities(move_probs)
+
     return best_move
 
 
 @chess_manager.reset
 def reset_func(ctx: GameContext):
-    global model
+    global model, transposition_table
 
     if model is None:
         initialize_model()
+    
+    transposition_table.clear()
