@@ -199,12 +199,12 @@ def get_move(ctx: GameContext) -> Move:
         raise ValueError("No legal moves available")
     num_pieces = len(ctx.board.piece_map())
     
-    if num_pieces <= 10:
-        search_depth = 5
-    elif num_pieces <= 20:
+    if num_pieces <= 8:
         search_depth = 4
-    else:
+    elif num_pieces <= 16:
         search_depth = 3
+    else:
+        search_depth = 2
 
     maximizing = ctx.board.turn
     best_eval, best_move = minimax_search(ctx.board, search_depth, float('-inf'), float('inf'), maximizing)
@@ -222,7 +222,6 @@ def get_move(ctx: GameContext) -> Move:
 
     move_probs = {move: prob for move, prob in zip(legal_moves, probabilities)}
     ctx.logProbabilities(move_probs)
-    print(f"Selected: {best_move} (eval: {best_eval:.3f})")
     return best_move
 
 
