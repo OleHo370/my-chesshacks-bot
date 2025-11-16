@@ -81,7 +81,7 @@ nn_eval_cache = {}
 MAX_CACHE_SIZE = 100000
 
 game_start_time = None
-total_time_budget = 57.0 
+total_time_budget = 57.0
 moves_made = 0
 
 search_start_time = None
@@ -102,16 +102,15 @@ def get_time_for_move():
     global game_start_time, total_time_budget, moves_made
     
     if game_start_time is None:
-        return 0.25
+        return 0.20
     
     elapsed = time.time() - game_start_time
-    remaining = max(total_time_budget - elapsed, 0.1)
+    remaining = max(total_time_budget - elapsed, 0.08)
     
-    estimated_moves_left = max(120 - moves_made, 8)
+    estimated_moves_left = max(135 - moves_made, 9)
     time_per_move = remaining / estimated_moves_left
     
-
-    return max(min(time_per_move * 1.2, 0.5), 0.05)
+    return max(min(time_per_move * 1.0, 0.4), 0.035)
 
 
 def should_stop_search():
@@ -177,7 +176,7 @@ def quiescence_search(board, alpha, beta, maximizing_player, depth=0):
     if nodes_searched % 1000 == 0 and should_stop_search():
         return 0.0
     
-    if depth >= 6:
+    if depth >= 5:
         return evaluate_with_nn(board)
     
     stand_pat = evaluate_with_nn(board)
@@ -305,7 +304,7 @@ def iterative_deepening_search(board, max_depth, maximizing, time_budget):
             best_move = move
             best_eval = eval_score
         
-        if abs(eval_score) > 9.5:
+        if abs(eval_score) > 9.2:
             break
     
     return best_eval, best_move
@@ -377,13 +376,13 @@ def get_move(ctx: GameContext) -> Move:
     num_pieces = len(ctx.board.piece_map())
     
     if num_pieces <= 6:
-        max_depth = 5
-    elif num_pieces <= 12:
         max_depth = 4
+    elif num_pieces <= 12:
+        max_depth = 3
     elif num_pieces <= 20:
         max_depth = 3
     else:
-        max_depth = 3
+        max_depth = 2
 
     time_for_move = get_time_for_move()
     maximizing = ctx.board.turn
