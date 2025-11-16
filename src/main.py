@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import time
 
 class ChessEvaluationNet(nn.Module):
     def __init__(self, input_size=840, hidden_sizes=[512, 256, 128]):
@@ -71,32 +72,59 @@ class BoardEncoder:
 
         return np.array(features, dtype=np.float32)
 
+
 model = None
 encoder = BoardEncoder()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-transposition_table = {}
-MAX_TABLE_SIZE = 50000
+nn_eval_cache = {}
+MAX_CACHE_SIZE = 100000
+
+game_start_time = None
+total_time_budget = 57.0
+moves_made = 0
+
+search_start_time = None
+time_limit = None
+nodes_searched = 0
+
 
 def initialize_model():
     global model
-
     model_path = os.path.join(os.path.dirname(__file__), "weights", "model.pt")
-
     model = ChessEvaluationNet().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
-
     return model
 
-def get_position_key(board):
-    return (board.fen().split(' ')[0], board.turn)
+
+def get_time_for_move():
+    global game_start_time, total_time_budget, moves_made
+    
+    if game_start_time is None:
+        return 0.15
+    
+    elapsed = time.time() - game_start_time
+    remaining = max(total_time_budget - elapsed, 0.05)
+    
+    estimated_moves_left = max(150 - moves_made, 10)
+    time_per_move = remaining / estimated_moves_left
+    
+    return max(min(time_per_move * 0.8, 0.3), 0.02)
+
+
+def should_stop_search():
+    global search_start_time, time_limit
+    if time_limit is None or search_start_time is None:
+        return False
+    return (time.time() - search_start_time) >= time_limit
+
 
 def evaluate_with_nn(board):
-    pos_key = get_position_key(board)
+    fen = board.fen().split(' ')[0]
     
-    if pos_key in transposition_table:
-        return transposition_table[pos_key]
+    if fen in nn_eval_cache:
+        return nn_eval_cache[fen]
     
     board_features = encoder.encode_board(board)
     board_tensor = torch.from_numpy(board_features).unsqueeze(0).to(device)
@@ -104,10 +132,14 @@ def evaluate_with_nn(board):
     with torch.no_grad():
         evaluation = model(board_tensor).item()
     
-    if len(transposition_table) < MAX_TABLE_SIZE:
-        transposition_table[pos_key] = evaluation
+    if len(nn_eval_cache) >= MAX_CACHE_SIZE:
+        items_to_remove = MAX_CACHE_SIZE // 5
+        for key in list(nn_eval_cache.keys())[:items_to_remove]:
+            del nn_eval_cache[key]
     
+    nn_eval_cache[fen] = evaluation
     return evaluation
+
 
 def order_moves(board, moves):
     move_scores = []
@@ -121,32 +153,92 @@ def order_moves(board, moves):
                 victim_value = [0, 1, 3, 3, 5, 9, 0][captured_piece.piece_type]
                 attacker = board.piece_at(move.from_square)
                 attacker_value = [0, 1, 3, 3, 5, 9, 0][attacker.piece_type] if attacker else 0
-                score += (victim_value * 10 - attacker_value)
+                score += 1000 + (victim_value * 10 - attacker_value)
         
         board.push(move)
         if board.is_check():
-            score += 5
+            score += 50
         board.pop()
 
         if move.promotion:
-            score += 9
+            score += 900
         
         move_scores.append((score, move))
 
     move_scores.sort(reverse=True, key=lambda x: x[0])
     return [move for _, move in move_scores]
 
-def minimax_search(board, depth, alpha, beta, maximizing_player):
+
+def quiescence_search(board, alpha, beta, maximizing_player, depth=0):
+    global nodes_searched
+    nodes_searched += 1
+    
+    if nodes_searched % 1000 == 0 and should_stop_search():
+        return 0.0
+    
+    if depth >= 4:
+        return evaluate_with_nn(board)
+    
+    stand_pat = evaluate_with_nn(board)
+    
+    if maximizing_player:
+        if stand_pat >= beta:
+            return beta
+        alpha = max(alpha, stand_pat)
+    else:
+        if stand_pat <= alpha:
+            return alpha
+        beta = min(beta, stand_pat)
+    
+    tactical_moves = [m for m in board.legal_moves 
+                      if board.is_capture(m) or board.gives_check(m)]
+    
+    if not tactical_moves:
+        return stand_pat
+    
+    tactical_moves = order_moves(board, tactical_moves)
+    
+    for move in tactical_moves:
+        board.push(move)
+        
+        if board.is_checkmate():
+            score = -10.0
+        else:
+            score = -quiescence_search(board, -beta, -alpha, not maximizing_player, depth + 1)
+        
+        board.pop()
+        
+        if maximizing_player:
+            alpha = max(alpha, score)
+            if alpha >= beta:
+                break
+        else:
+            beta = min(beta, score)
+            if beta <= alpha:
+                break
+    
+    return alpha if maximizing_player else beta
+
+
+def minimax_search(board, depth, alpha, beta, maximizing_player, use_quiescence=True):
+    global nodes_searched
+    nodes_searched += 1
+    
+    if nodes_searched % 100 == 0 and should_stop_search():
+        return 0.0, None
     
     if board.is_checkmate():
-        return (-10.0 if maximizing_player else 10.0), None
+        return -10.0, None
     
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0, None
     
     if depth == 0:
-        evaluation = evaluate_with_nn(board)
-        return evaluation, None
+        if use_quiescence:
+            eval_score = quiescence_search(board, alpha, beta, maximizing_player)
+        else:
+            eval_score = evaluate_with_nn(board)
+        return eval_score, None
     
     legal_moves = list(board.legal_moves)
     if not legal_moves:
@@ -157,10 +249,9 @@ def minimax_search(board, depth, alpha, beta, maximizing_player):
 
     if maximizing_player:
         max_eval = float('-inf')
-
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, False)
+            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, False, use_quiescence)
             board.pop()
 
             if eval_score > max_eval:
@@ -169,16 +260,15 @@ def minimax_search(board, depth, alpha, beta, maximizing_player):
             
             alpha = max(alpha, eval_score)
             if beta <= alpha:
-                break 
+                break
         
         return max_eval, best_move
     
     else:
         min_eval = float('inf')
-
         for move in legal_moves:
             board.push(move)
-            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, True)
+            eval_score, _ = minimax_search(board, depth - 1, alpha, beta, True, use_quiescence)
             board.pop()
 
             if eval_score < min_eval:
@@ -188,27 +278,54 @@ def minimax_search(board, depth, alpha, beta, maximizing_player):
             beta = min(beta, eval_score)
             if beta <= alpha:
                 break
-
+        
         return min_eval, best_move
+
+
+def iterative_deepening_search(board, max_depth, maximizing, time_budget):
+    global search_start_time, time_limit, nodes_searched
+    
+    search_start_time = time.time()
+    time_limit = time_budget
+    nodes_searched = 0
+    
+    best_move = None
+    best_eval = 0.0
+    
+    for depth in range(1, max_depth + 1):
+        if should_stop_search():
+            break
+        
+        eval_score, move = minimax_search(
+            board, depth, float('-inf'), float('inf'), maximizing
+        )
+        
+        if move is not None:
+            best_move = move
+            best_eval = eval_score
+        
+        if abs(eval_score) > 9.0:
+            break
+    
+    return best_eval, best_move
+
 
 def batch_evaluate_moves(board, moves):
     if len(moves) == 0:
         return {}
     
     features_list = []
-    valid_moves = []
+    moves_to_eval = []
     
     for move in moves:
         board.push(move)
-        pos_key = get_position_key(board)
+        fen = board.fen().split(' ')[0]
         
-        if pos_key in transposition_table:
-            board.pop()
-            continue
+        if fen not in nn_eval_cache:
+            features = encoder.encode_board(board)
+            features_list.append(features)
+            moves_to_eval.append((move, fen))
         
-        features = encoder.encode_board(board)
-        features_list.append(features)
-        valid_moves.append((move, pos_key))
         board.pop()
     
     if features_list:
@@ -221,25 +338,29 @@ def batch_evaluate_moves(board, moves):
         else:
             evaluations = evaluations.tolist()
         
-        for (move, pos_key), eval_score in zip(valid_moves, evaluations):
-            if len(transposition_table) < MAX_TABLE_SIZE:
-                transposition_table[pos_key] = eval_score
+        for (move, fen), eval_score in zip(moves_to_eval, evaluations):
+            if len(nn_eval_cache) < MAX_CACHE_SIZE:
+                nn_eval_cache[fen] = eval_score
     
     move_scores = {}
     for move in moves:
         board.push(move)
-        pos_key = get_position_key(board)
-        move_scores[move] = transposition_table.get(pos_key, 0.0)
+        fen = board.fen().split(' ')[0]
+        move_scores[move] = nn_eval_cache.get(fen, 0.0)
         board.pop()
     
     return move_scores
 
+
 @chess_manager.entrypoint
 def get_move(ctx: GameContext) -> Move:
-    global model
+    global model, game_start_time, moves_made
 
     if model is None:
         initialize_model()
+    
+    if game_start_time is None:
+        game_start_time = time.time()
     
     legal_moves = list(ctx.board.generate_legal_moves())
 
@@ -247,26 +368,33 @@ def get_move(ctx: GameContext) -> Move:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available")
     
+    if len(legal_moves) == 1:
+        ctx.logProbabilities({legal_moves[0]: 1.0})
+        moves_made += 1
+        return legal_moves[0]
+    
     num_pieces = len(ctx.board.piece_map())
     
-    if num_pieces <= 5:
-        search_depth = 3
-    elif num_pieces <= 8:
-        search_depth = 2
+    if num_pieces <= 6:
+        max_depth = 4
+    elif num_pieces <= 12:
+        max_depth = 3
+    elif num_pieces <= 20:
+        max_depth = 3
     else:
-        search_depth = 1
+        max_depth = 2
 
+    time_for_move = get_time_for_move()
     maximizing = ctx.board.turn
     
-    best_eval, best_move = minimax_search(
-        ctx.board, search_depth, float('-inf'), float('inf'), maximizing
+    best_eval, best_move = iterative_deepening_search(
+        ctx.board, max_depth, maximizing, time_for_move
     )
     
     if best_move is None:
         best_move = legal_moves[0]
     
     move_scores = batch_evaluate_moves(ctx.board, legal_moves)
-    
     scores_array = np.array([move_scores[move] for move in legal_moves])
 
     if not ctx.board.turn:
@@ -277,15 +405,22 @@ def get_move(ctx: GameContext) -> Move:
 
     move_probs = {move: prob for move, prob in zip(legal_moves, probabilities)}
     ctx.logProbabilities(move_probs)
-
+    
+    moves_made += 1
     return best_move
 
 
 @chess_manager.reset
 def reset_func(ctx: GameContext):
-    global model, transposition_table
+    global model, nn_eval_cache, game_start_time, moves_made
+    global search_start_time, time_limit, nodes_searched
 
     if model is None:
         initialize_model()
     
-    transposition_table.clear()
+    nn_eval_cache.clear()
+    game_start_time = None
+    moves_made = 0
+    search_start_time = None
+    time_limit = None
+    nodes_searched = 0
